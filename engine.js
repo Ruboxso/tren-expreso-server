@@ -341,8 +341,8 @@ function vistaParaJugador(state, playerId) {
 }
 
 module.exports = {
-  MAPS_DATA, crearPartida, vistaParaJugador,
+  MAPS_DATA, PLAYER_TRAINS, crearPartida, vistaParaJugador,
   accionRobarVisible, accionRobarMazo, accionSeleccionarVia,
   accionPedirBilletes, accionConfirmarBilletes,
 };
-    
+       
