@@ -22,6 +22,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const engine = require('./engine');
+const { verificarUsuario, obtenerPerfil, premiarPartida } = require('./supabaseAdmin');
 
 const app = express();
 const server = http.createServer(app);
@@ -47,6 +48,7 @@ app.get('/', (req, res) => {
    datos en vez de en una variable normal.
 */
 const rooms = {}; // codigo -> { code, players:[{id,name,isHost}], started:bool, mapKey, game }
+const onlineUsers = {}; // supabaseId -> socketId (solo cuentas con sesión iniciada, conectadas ahora mismo)
 
 function generarCodigo() {
   const letras = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin 0/O/1/I para que no se confundan al dictarlo
@@ -76,19 +78,55 @@ function broadcastGameState(room) {
   });
 }
 
+async function nombreDePerfil(usuario, nombreRespaldo) {
+  const perfil = await obtenerPerfil(usuario.id);
+  return (perfil && perfil.display_name) || nombreRespaldo;
+}
+
+async function revisarFinDePartida(room) {
+  if (!room.game || !room.game.ended || room.game.rewarded) return;
+  room.game.rewarded = true;
+  const maxScore = Math.max(...room.game.players.map(p => p.score || 0));
+  for (const p of room.game.players) {
+    if (!p.supabaseId) continue; // jugador invitado, sin cuenta: no hay monedas que dar
+    const gano = (p.score || 0) === maxScore;
+    const vagonesUsados = engine.PLAYER_TRAINS - p.trains;
+    await premiarPartida(p.supabaseId, gano, p.score || 0, vagonesUsados);
+  }
+}
+
 io.on('connection', (socket) => {
   console.log('Nueva conexión:', socket.id);
 
+  // --- registrar presencia (para saber qué amigos están conectados ahora) ---
+  socket.on('authenticate', async ({ authToken }) => {
+    const usuario = await verificarUsuario(authToken);
+    if (usuario) { socket.data.supabaseId = usuario.id; onlineUsers[usuario.id] = socket.id; }
+  });
+
+  socket.on('checkFriendsOnline', ({ friendIds }) => {
+    const online = (friendIds || []).filter(id => !!onlineUsers[id]);
+    socket.emit('friendsOnline', { online });
+  });
+
+  socket.on('inviteFriend', ({ friendId, code, fromName }) => {
+    const targetSocketId = onlineUsers[friendId];
+    if (!targetSocketId) { socket.emit('errorMsg', 'Ese amigo no está conectado ahora mismo'); return; }
+    io.to(targetSocketId).emit('roomInvite', { code, fromName });
+  });
+
   // --- crear una sala nueva ---
-  socket.on('createRoom', ({ name }) => {
+  socket.on('createRoom', async ({ name, authToken }) => {
+    const usuario = await verificarUsuario(authToken);
     const code = generarCodigo();
     const room = {
       code,
       hostId: socket.id,
-      players: [{ id: socket.id, name: (name || 'Jugador').slice(0, 20) }],
+      players: [{ id: socket.id, name: (usuario ? await nombreDePerfil(usuario, name) : name) || 'Jugador', supabaseId: usuario ? usuario.id : null }],
       started: false,
       mapKey: 'medi',
     };
+    room.players[0].name = room.players[0].name.slice(0, 20);
     rooms[code] = room;
     socket.join(code);
     socket.data.roomCode = code;
@@ -106,17 +144,20 @@ io.on('connection', (socket) => {
   });
 
   // --- unirse a una sala existente ---
-  socket.on('joinRoom', ({ code, name }) => {
+  socket.on('joinRoom', async ({ code, name, authToken }) => {
     code = (code || '').toUpperCase().trim();
     const room = rooms[code];
     if (!room) { socket.emit('errorMsg', 'No existe ninguna sala con ese código'); return; }
     if (room.started) { socket.emit('errorMsg', 'Esa partida ya ha empezado'); return; }
     if (room.players.length >= 4) { socket.emit('errorMsg', 'La sala ya está llena (máximo 4)'); return; }
 
-    room.players.push({ id: socket.id, name: (name || 'Jugador').slice(0, 20) });
+    const usuario = await verificarUsuario(authToken);
+    const nombreFinal = ((usuario ? await nombreDePerfil(usuario, name) : name) || 'Jugador').slice(0, 20);
+    room.players.push({ id: socket.id, name: nombreFinal, supabaseId: usuario ? usuario.id : null });
     socket.join(code);
     socket.data.roomCode = code;
 
+    // avisamos a todos los de la sala (incluido el que se acaba de unir) del estado actualizado
     io.to(code).emit('roomJoined', resumenSala(room));
   });
 
@@ -138,7 +179,7 @@ io.on('connection', (socket) => {
   });
 
   // --- acciones dentro de la partida ---
-  function conRoomYPartida(socket, fn) {
+  async function conRoomYPartida(socket, fn) {
     const code = socket.data.roomCode;
     const room = rooms[code];
     if (!room || !room.game) { socket.emit('errorMsg', 'No hay ninguna partida en marcha'); return; }
@@ -147,6 +188,7 @@ io.on('connection', (socket) => {
       socket.emit('errorMsg', resultado.error);
       return;
     }
+    await revisarFinDePartida(room);
     broadcastGameState(room);
   }
 
@@ -167,7 +209,12 @@ io.on('connection', (socket) => {
   });
 
   // --- se cierra la pestaña / se pierde la conexión ---
-  socket.on('disconnect', () => salirDeSala(socket));
+  socket.on('disconnect', () => {
+    if (socket.data.supabaseId && onlineUsers[socket.data.supabaseId] === socket.id) {
+      delete onlineUsers[socket.data.supabaseId];
+    }
+    salirDeSala(socket);
+  });
 
   function salirDeSala(socket) {
     const code = socket.data.roomCode;
@@ -179,11 +226,11 @@ io.on('connection', (socket) => {
     socket.data.roomCode = null;
 
     if (room.players.length === 0) {
-      delete rooms[code];
+      delete rooms[code]; // sala vacía, la borramos
       return;
     }
     if (room.hostId === socket.id) {
-      room.hostId = room.players[0].id;
+      room.hostId = room.players[0].id; // el anfitrión se fue: pasa el testigo al siguiente
     }
     io.to(code).emit('roomJoined', resumenSala(room));
   }
