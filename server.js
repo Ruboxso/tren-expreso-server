@@ -134,6 +134,13 @@ io.on('connection', (socket) => {
     socket.emit('friendsOnline', { online });
   });
 
+  // --- chat global sencillo (no se guarda, solo se retransmite a quien esté conectado ahora) ---
+  socket.on('chatMessage', ({ text, name }) => {
+    const msg = (text || '').toString().trim().slice(0, 300);
+    if (!msg) return;
+    io.emit('chatMessage', { name: (name || 'Alguien').toString().slice(0, 20), text: msg, at: Date.now() });
+  });
+
   socket.on('inviteFriend', ({ friendId, code, fromName }) => {
     const targetSocketId = onlineUsers[friendId];
     if (!targetSocketId) { socket.emit('errorMsg', 'Ese amigo no está conectado ahora mismo'); return; }
