@@ -369,8 +369,7 @@ function finalizarTurno(state) {
   state.current = (state.current + 1) % state.players.length;
 }
 
-function finalizarPartida(state) {
-  state.ended = true;
+function calcularPuntuaciones(state) {
   const idxOf = {};
   const allCityIds = Array.from(new Set(state.routes.flatMap(r => [r.a, r.b])));
   allCityIds.forEach((id, i) => { idxOf[id] = i; });
@@ -402,8 +401,14 @@ function finalizarPartida(state) {
   });
 }
 
+function finalizarPartida(state) {
+  state.ended = true;
+  calcularPuntuaciones(state);
+}
+
 /* ---------- qué le mandamos a cada jugador (oculta las manos ajenas) ---------- */
 function vistaParaJugador(state, playerId) {
+  if (!state.ended) calcularPuntuaciones(state); // puntuación siempre al día, no solo al terminar
   return {
     mapKey: state.mapKey,
     rules: state.rules,
@@ -426,8 +431,8 @@ function vistaParaJugador(state, playerId) {
       ticketCount: p.tickets.length,
       stations: p.stations, stationCities: p.stationCities,
       skipNextBuild: p.skipNextBuild,
-      // la mano y los billetes solo se mandan completos al propio jugador MIENTRAS la partida sigue en marcha;
-      // al terminar, se revelan los de todos (así funciona el juego de mesa real)
+      // la mano de cartas sí sigue siendo privada; los billetes de destino ya no son secretos —
+      // se ven completos de todos, en todo momento, con quién está conectado y quién no
       hand: (p.id === playerId || state.ended) ? p.hand : undefined,
       tickets: (p.id === playerId || state.ended) ? p.tickets : undefined,
       ticketResults: (p.id === playerId || state.ended) ? p.ticketResults : undefined,
@@ -442,3 +447,4 @@ module.exports = {
   accionSabotaje, accionDemolicion, accionEstacion,
   hayEleccionInicialPendiente,
 };
+       
