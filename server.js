@@ -209,7 +209,35 @@ io.on('connection', (socket) => {
   });
 
   // --- salir de la sala a propósito ---
-  socket.on('leaveRoom', () => salirDeSala(socket));
+  socket.on('leaveRoom', () => salirDeSala(socket, true));
+
+  // --- volver a entrar a una partida en marcha, tras perder la conexión un momento ---
+  socket.on('rejoinRoom', async ({ code, name, authToken }) => {
+    code = (code || '').toUpperCase().trim();
+    const room = rooms[code];
+    if (!room || !room.game) { socket.emit('errorMsg', 'Esa sala ya no existe'); return; }
+
+    const usuario = await verificarUsuario(authToken);
+    let jugador = usuario ? room.players.find(p => p.supabaseId === usuario.id) : null;
+    if (!jugador) jugador = room.players.find(p => p.name === name);
+    if (!jugador) { socket.emit('errorMsg', 'No se te encuentra en esa partida'); return; }
+
+    const idAnterior = jugador.id;
+    jugador.id = socket.id;
+    const jugadorPartida = room.game.players.find(p => p.id === idAnterior);
+    if (jugadorPartida) jugadorPartida.id = socket.id;
+    if (room.hostId === idAnterior) room.hostId = socket.id;
+    if (room.game.pendingTickets[idAnterior]) {
+      room.game.pendingTickets[socket.id] = room.game.pendingTickets[idAnterior];
+      delete room.game.pendingTickets[idAnterior];
+    }
+    if (usuario) onlineUsers[usuario.id] = socket.id;
+
+    socket.join(code);
+    socket.data.roomCode = code;
+    socket.emit('gameStarted', {});
+    broadcastGameState(room);
+  });
 
   // --- el anfitrión pulsa "Empezar partida" ---
   socket.on('startGame', () => {
@@ -277,13 +305,22 @@ io.on('connection', (socket) => {
     if (socket.data.supabaseId && onlineUsers[socket.data.supabaseId] === socket.id) {
       delete onlineUsers[socket.data.supabaseId];
     }
-    salirDeSala(socket);
+    salirDeSala(socket, false);
   });
 
-  function salirDeSala(socket) {
+  function salirDeSala(socket, voluntario) {
     const code = socket.data.roomCode;
     const room = rooms[code];
     if (!room) return;
+
+    // si la partida ya empezó y no ha sido un "salir" a propósito, le guardamos el sitio
+    // por si vuelve a conectar (rejoinRoom) — solo lo quitamos del todo si sale él mismo
+    // o si la sala aún estaba en la sala de espera (ahí sí molesta un hueco fantasma)
+    if (room.started && room.game && !room.game.ended && !voluntario) {
+      socket.leave(code);
+      socket.data.roomCode = null;
+      return;
+    }
 
     room.players = room.players.filter(p => p.id !== socket.id);
     socket.leave(code);
