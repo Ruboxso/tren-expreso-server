@@ -407,6 +407,7 @@ function vistaParaJugador(state, playerId) {
   return {
     mapKey: state.mapKey,
     rules: state.rules,
+    turnDeadline: state.turnDeadline || null,
     current: state.players[state.current].id,
     drawsUsed: state.drawsUsed,
     lastRound: state.lastRound,
@@ -439,5 +440,5 @@ module.exports = {
   accionRobarVisible, accionRobarMazo, accionSeleccionarVia,
   accionPedirBilletes, accionConfirmarBilletes,
   accionSabotaje, accionDemolicion, accionEstacion,
+  hayEleccionInicialPendiente,
 };
-     
