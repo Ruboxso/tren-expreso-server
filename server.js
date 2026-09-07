@@ -68,6 +68,7 @@ function resumenSala(room) {
     mapKey: room.mapKey,
     mapNames: Object.fromEntries(Object.keys(engine.MAPS_DATA).map(k => [k, engine.MAPS_DATA[k].name])),
     rules: room.rules,
+    turnTimerSec: room.turnTimerSec,
     players: room.players.map(p => ({ id: p.id, name: p.name, isHost: p.id === room.hostId })),
   };
 }
@@ -87,6 +88,7 @@ async function nombreDePerfil(usuario, nombreRespaldo) {
 async function revisarFinDePartida(room) {
   if (!room.game || !room.game.ended || room.game.rewarded) return;
   room.game.rewarded = true;
+  if (room.turnTimeoutHandle) { clearTimeout(room.turnTimeoutHandle); room.turnTimeoutHandle = null; }
   const maxScore = Math.max(...room.game.players.map(p => p.score || 0));
   for (const p of room.game.players) {
     if (!p.supabaseId) continue; // jugador invitado, sin cuenta: no hay monedas que dar
@@ -94,6 +96,28 @@ async function revisarFinDePartida(room) {
     const vagonesUsados = engine.PLAYER_TRAINS - p.trains;
     await premiarPartida(p.supabaseId, gano, p.score || 0, vagonesUsados);
   }
+}
+
+/* ---------- tiempo por turno (lo controla el servidor, no cada móvil) ---------- */
+function scheduleTurnTimeout(room) {
+  if (room.turnTimeoutHandle) { clearTimeout(room.turnTimeoutHandle); room.turnTimeoutHandle = null; }
+  if (!room.turnTimerSec || room.turnTimerSec <= 0 || !room.game || room.game.ended) {
+    if (room.game) room.game.turnDeadline = null;
+    return;
+  }
+  room.game.turnDeadline = Date.now() + room.turnTimerSec * 1000;
+  room.turnTimeoutHandle = setTimeout(() => forceTimeoutPlay(room), room.turnTimerSec * 1000);
+}
+
+async function forceTimeoutPlay(room) {
+  if (!room.game || room.game.ended) return;
+  const jugador = room.game.players[room.game.current];
+  const antes = room.game.current;
+  engine.accionRobarMazo(room.game, jugador.id);
+  if (!room.game.ended && room.game.current === antes) engine.accionRobarMazo(room.game, jugador.id);
+  await revisarFinDePartida(room);
+  if (!room.game.ended) scheduleTurnTimeout(room);
+  broadcastGameState(room);
 }
 
 io.on('connection', (socket) => {
@@ -117,7 +141,7 @@ io.on('connection', (socket) => {
   });
 
   // --- crear una sala nueva ---
-  socket.on('createRoom', async ({ name, authToken, rules }) => {
+  socket.on('createRoom', async ({ name, authToken, rules, turnTimerSec }) => {
     const usuario = await verificarUsuario(authToken);
     const code = generarCodigo();
     const room = {
@@ -127,6 +151,9 @@ io.on('connection', (socket) => {
       started: false,
       mapKey: 'medi',
       rules: rules || { sabotage: false, demolition: false, stations: false, cooldown: false },
+      turnTimerSec: turnTimerSec || 0,
+      timerStarted: false,
+      turnTimeoutHandle: null,
     };
     room.players[0].name = room.players[0].name.slice(0, 20);
     rooms[code] = room;
@@ -141,6 +168,15 @@ io.on('connection', (socket) => {
     const room = rooms[code];
     if (!room || room.hostId !== socket.id || room.started) return;
     room.rules = rules || room.rules;
+    io.to(code).emit('roomJoined', resumenSala(room));
+  });
+
+  // --- el anfitrión cambia el tiempo por turno antes de empezar ---
+  socket.on('setTurnTimer', ({ turnTimerSec }) => {
+    const code = socket.data.roomCode;
+    const room = rooms[code];
+    if (!room || room.hostId !== socket.id || room.started) return;
+    room.turnTimerSec = turnTimerSec || 0;
     io.to(code).emit('roomJoined', resumenSala(room));
   });
 
@@ -194,12 +230,20 @@ io.on('connection', (socket) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
     if (!room || !room.game) { socket.emit('errorMsg', 'No hay ninguna partida en marcha'); return; }
+    const antes = room.game.current;
     const resultado = fn(room);
     if (resultado && resultado.ok === false) {
       socket.emit('errorMsg', resultado.error);
       return;
     }
     await revisarFinDePartida(room);
+    if (!room.game.ended) {
+      const siguenBilletesIniciales = engine.hayEleccionInicialPendiente(room.game);
+      if (!siguenBilletesIniciales && (!room.timerStarted || room.game.current !== antes)) {
+        room.timerStarted = true;
+        scheduleTurnTimeout(room);
+      }
+    }
     broadcastGameState(room);
   }
 
@@ -246,6 +290,7 @@ io.on('connection', (socket) => {
     socket.data.roomCode = null;
 
     if (room.players.length === 0) {
+      if (room.turnTimeoutHandle) clearTimeout(room.turnTimeoutHandle);
       delete rooms[code]; // sala vacía, la borramos
       return;
     }
