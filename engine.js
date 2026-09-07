@@ -83,16 +83,20 @@ function longestTrail(edges) {
 }
 
 /* ---------- crear una partida nueva a partir de los jugadores de una sala ---------- */
-function crearPartida(mapKey, players) {
+function crearPartida(mapKey, players, rules) {
+  rules = rules || { sabotage:false, demolition:false, stations:false, cooldown:false };
   const mapa = construirMapa(mapKey);
   let deck = [];
   COLORS.forEach(c => { for (let i = 0; i < 12; i++) deck.push(c); });
   for (let i = 0; i < 14; i++) deck.push('locomotora');
+  if (rules.sabotage) for (let i = 0; i < 3; i++) deck.push('sabotaje');
+  if (rules.demolition) for (let i = 0; i < 3; i++) deck.push('demolicion');
   deck = shuffle(deck);
 
   const gamePlayers = players.map((p, i) => ({
     id: p.id, name: p.name, color: i,
     trains: PLAYER_TRAINS, hand: {}, routes: [], tickets: [], score: 0,
+    stations: rules.stations ? 3 : 0, stationCities: [], skipNextBuild: false,
   }));
 
   const faceUp = [];
@@ -103,7 +107,7 @@ function crearPartida(mapKey, players) {
     players: gamePlayers, deck, discard: [], faceUp, ticketDeck: shuffle(mapa.tickets),
     current: 0, drawsUsed: 0, claim: null,
     lastRound: false, lastRoundStarter: null, ended: false,
-    log: [],
+    log: [], rules,
     pendingTickets: {}, // playerId -> { opciones, minKeep, isInitial }
   };
 
@@ -217,6 +221,7 @@ function accionSeleccionarVia(state, playerId, routeId, colorElegido) {
   if (hayEleccionInicialPendiente(state)) return { ok: false, error: 'Esperando a que todos elijan sus billetes iniciales' };
   const p = curPlayer(state);
   if (p.id !== playerId) return { ok: false, error: 'No es tu turno' };
+  if (state.rules.cooldown && p.skipNextBuild === 'active') return { ok: false, error: 'Acabas de construir: este turno solo puedes robar o pedir billetes' };
   const route = routeById(state, routeId);
   if (!route) return { ok: false, error: 'Vía inexistente' };
   if (routeOwner(state, routeId)) return { ok: false, error: 'Esa vía ya está ocupada' };
@@ -234,6 +239,7 @@ function accionSeleccionarVia(state, playerId, routeId, colorElegido) {
   for (let i = 0; i < useLoco; i++) state.discard.push('locomotora');
   p.trains -= route.len;
   p.routes.push(route.id);
+  if (state.rules.cooldown) p.skipNextBuild = 'pending';
   addLog(state, `${p.name} reclama una vía (${route.len} vagones).`);
 
   if (p.trains <= 2 && !state.lastRound) {
@@ -273,9 +279,88 @@ function accionConfirmarBilletes(state, playerId, indicesElegidos) {
   return { ok: true };
 }
 
+/* ---- choque de trenes ---- */
+function accionSabotaje(state, playerId, routeId) {
+  if (hayEleccionInicialPendiente(state)) return { ok: false, error: 'Esperando a que todos elijan sus billetes iniciales' };
+  const p = curPlayer(state);
+  if (p.id !== playerId) return { ok: false, error: 'No es tu turno' };
+  if (state.drawsUsed > 0) return { ok: false, error: 'No puedes hacer eso ahora' };
+  if (!p.hand['sabotaje']) return { ok: false, error: 'No tienes cartas de Choque de Trenes' };
+  const route = routeById(state, routeId);
+  if (!route) return { ok: false, error: 'Vía inexistente' };
+  const defender = routeOwner(state, routeId);
+  if (!defender || defender.id === playerId) return { ok: false, error: 'Elige una vía de un rival' };
+
+  p.hand['sabotaje']--; if (p.hand['sabotaje'] <= 0) delete p.hand['sabotaje'];
+  const attackerSize = Object.values(p.hand).reduce((a, b) => a + b, 0);
+  const defenderSize = Object.values(defender.hand).reduce((a, b) => a + b, 0);
+  const win = attackerSize > defenderSize;
+
+  [p, defender].forEach(player => {
+    Object.keys(player.hand).forEach(c => { for (let i = 0; i < player.hand[c]; i++) state.discard.push(c); });
+    player.hand = {};
+  });
+
+  if (win) {
+    defender.routes = defender.routes.filter(id => id !== route.id);
+    defender.trains += route.len;
+    p.routes.push(route.id);
+    addLog(state, `${p.name} choca ${attackerSize} cartas contra las ${defenderSize} de ${defender.name} y se queda con su vía. Ambos pierden la mano.`);
+  } else {
+    addLog(state, `${p.name} choca ${attackerSize} cartas contra las ${defenderSize} de ${defender.name} y pierde: conserva su vía. Ambos pierden la mano.`);
+  }
+  finalizarTurno(state);
+  return { ok: true, gano: win };
+}
+
+/* ---- demolición ---- */
+function accionDemolicion(state, playerId, routeId) {
+  if (hayEleccionInicialPendiente(state)) return { ok: false, error: 'Esperando a que todos elijan sus billetes iniciales' };
+  const p = curPlayer(state);
+  if (p.id !== playerId) return { ok: false, error: 'No es tu turno' };
+  if (state.drawsUsed > 0) return { ok: false, error: 'No puedes hacer eso ahora' };
+  if (!p.hand['demolicion']) return { ok: false, error: 'No tienes cartas de Demolición' };
+  const route = routeById(state, routeId);
+  if (!route) return { ok: false, error: 'Vía inexistente' };
+  const defender = routeOwner(state, routeId);
+  if (!defender || defender.id === playerId) return { ok: false, error: 'Elige una vía de un rival' };
+
+  p.hand['demolicion']--; if (p.hand['demolicion'] <= 0) delete p.hand['demolicion'];
+  defender.routes = defender.routes.filter(id => id !== route.id);
+  defender.trains += route.len;
+  addLog(state, `${p.name} demuele la vía de ${defender.name}. Le devuelve sus vagones y la vía queda libre.`);
+  finalizarTurno(state);
+  return { ok: true };
+}
+
+/* ---- estaciones ---- */
+function accionEstacion(state, playerId, cityId) {
+  if (hayEleccionInicialPendiente(state)) return { ok: false, error: 'Esperando a que todos elijan sus billetes iniciales' };
+  const p = curPlayer(state);
+  if (p.id !== playerId) return { ok: false, error: 'No es tu turno' };
+  if (state.drawsUsed > 0) return { ok: false, error: 'No puedes hacer eso ahora' };
+  if (!state.rules.stations) return { ok: false, error: 'Las estaciones no están activadas en esta partida' };
+  if ((p.stations || 0) <= 0) return { ok: false, error: 'No te quedan estaciones' };
+  if (!p.hand['locomotora']) return { ok: false, error: 'Necesitas una carta locomotora' };
+  if ((p.stationCities || []).includes(cityId)) return { ok: false, error: 'Ya tienes una estación ahí' };
+
+  p.hand['locomotora']--; if (p.hand['locomotora'] <= 0) delete p.hand['locomotora'];
+  p.stations--;
+  if (!p.stationCities) p.stationCities = [];
+  p.stationCities.push(cityId);
+  addLog(state, `${p.name} construye una estación.`);
+  finalizarTurno(state);
+  return { ok: true };
+}
+
 function finalizarTurno(state) {
   state.drawsUsed = 0;
   state.claim = null;
+  if (state.rules && state.rules.cooldown) {
+    const cp = curPlayer(state);
+    if (cp.skipNextBuild === 'active') cp.skipNextBuild = false;
+    else if (cp.skipNextBuild === 'pending') cp.skipNextBuild = 'active';
+  }
   if (state.lastRound && state.current === state.lastRoundStarter && state._loopStarted) {
     finalizarPartida(state);
     return;
@@ -296,6 +381,11 @@ function finalizarPartida(state) {
     p.routePoints = score;
     const uf = unionFind(allCityIds.length);
     p.routes.forEach(rid => { const r = routeById(state, rid); uf.union(idxOf[r.a], idxOf[r.b]); });
+    (p.stationCities || []).forEach(cityId => {
+      state.routes.forEach(r => {
+        if ((r.a === cityId || r.b === cityId) && routeOwner(state, r.id)) uf.union(idxOf[r.a], idxOf[r.b]);
+      });
+    });
     p.ticketResults = p.tickets.map(t => {
       const connected = uf.find(idxOf[t.a]) === uf.find(idxOf[t.b]);
       score += connected ? t.pts : -t.pts;
@@ -316,6 +406,7 @@ function finalizarPartida(state) {
 function vistaParaJugador(state, playerId) {
   return {
     mapKey: state.mapKey,
+    rules: state.rules,
     current: state.players[state.current].id,
     drawsUsed: state.drawsUsed,
     lastRound: state.lastRound,
@@ -332,10 +423,13 @@ function vistaParaJugador(state, playerId) {
       longest: p.longest, longestBonus: p.longestBonus,
       handCount: Object.values(p.hand).reduce((a, b) => a + b, 0),
       ticketCount: p.tickets.length,
-      // la mano y los billetes solo se mandan completos al propio jugador
-      hand: p.id === playerId ? p.hand : undefined,
-      tickets: p.id === playerId ? p.tickets : undefined,
-      ticketResults: p.id === playerId ? p.ticketResults : undefined,
+      stations: p.stations, stationCities: p.stationCities,
+      skipNextBuild: p.skipNextBuild,
+      // la mano y los billetes solo se mandan completos al propio jugador MIENTRAS la partida sigue en marcha;
+      // al terminar, se revelan los de todos (así funciona el juego de mesa real)
+      hand: (p.id === playerId || state.ended) ? p.hand : undefined,
+      tickets: (p.id === playerId || state.ended) ? p.tickets : undefined,
+      ticketResults: (p.id === playerId || state.ended) ? p.ticketResults : undefined,
     })),
   };
 }
@@ -344,5 +438,6 @@ module.exports = {
   MAPS_DATA, PLAYER_TRAINS, crearPartida, vistaParaJugador,
   accionRobarVisible, accionRobarMazo, accionSeleccionarVia,
   accionPedirBilletes, accionConfirmarBilletes,
+  accionSabotaje, accionDemolicion, accionEstacion,
 };
-       
+     
