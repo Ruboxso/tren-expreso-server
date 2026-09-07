@@ -447,4 +447,4 @@ module.exports = {
   accionSabotaje, accionDemolicion, accionEstacion,
   hayEleccionInicialPendiente,
 };
-       
+   
