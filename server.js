@@ -67,6 +67,7 @@ function resumenSala(room) {
     started: room.started,
     mapKey: room.mapKey,
     mapNames: Object.fromEntries(Object.keys(engine.MAPS_DATA).map(k => [k, engine.MAPS_DATA[k].name])),
+    rules: room.rules,
     players: room.players.map(p => ({ id: p.id, name: p.name, isHost: p.id === room.hostId })),
   };
 }
@@ -116,7 +117,7 @@ io.on('connection', (socket) => {
   });
 
   // --- crear una sala nueva ---
-  socket.on('createRoom', async ({ name, authToken }) => {
+  socket.on('createRoom', async ({ name, authToken, rules }) => {
     const usuario = await verificarUsuario(authToken);
     const code = generarCodigo();
     const room = {
@@ -125,12 +126,22 @@ io.on('connection', (socket) => {
       players: [{ id: socket.id, name: (usuario ? await nombreDePerfil(usuario, name) : name) || 'Jugador', supabaseId: usuario ? usuario.id : null }],
       started: false,
       mapKey: 'medi',
+      rules: rules || { sabotage: false, demolition: false, stations: false, cooldown: false },
     };
     room.players[0].name = room.players[0].name.slice(0, 20);
     rooms[code] = room;
     socket.join(code);
     socket.data.roomCode = code;
     socket.emit('roomJoined', resumenSala(room));
+  });
+
+  // --- el anfitrión cambia las reglas opcionales antes de empezar ---
+  socket.on('setRules', ({ rules }) => {
+    const code = socket.data.roomCode;
+    const room = rooms[code];
+    if (!room || room.hostId !== socket.id || room.started) return;
+    room.rules = rules || room.rules;
+    io.to(code).emit('roomJoined', resumenSala(room));
   });
 
   // --- el anfitrión cambia el mapa antes de empezar ---
@@ -173,7 +184,7 @@ io.on('connection', (socket) => {
     if (room.players.length < 2) { socket.emit('errorMsg', 'Hacen falta al menos 2 jugadores'); return; }
 
     room.started = true;
-    room.game = engine.crearPartida(room.mapKey, room.players);
+    room.game = engine.crearPartida(room.mapKey, room.players, room.rules);
     io.to(code).emit('gameStarted', {});
     broadcastGameState(room);
   });
@@ -206,6 +217,15 @@ io.on('connection', (socket) => {
   });
   socket.on('confirmTickets', ({ indices }) => {
     conRoomYPartida(socket, room => engine.accionConfirmarBilletes(room.game, socket.id, indices));
+  });
+  socket.on('playSabotage', ({ routeId }) => {
+    conRoomYPartida(socket, room => engine.accionSabotaje(room.game, socket.id, routeId));
+  });
+  socket.on('playDemolition', ({ routeId }) => {
+    conRoomYPartida(socket, room => engine.accionDemolicion(room.game, socket.id, routeId));
+  });
+  socket.on('playStation', ({ cityId }) => {
+    conRoomYPartida(socket, room => engine.accionEstacion(room.game, socket.id, cityId));
   });
 
   // --- se cierra la pestaña / se pierde la conexión ---
