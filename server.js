@@ -198,11 +198,49 @@ io.on('connection', (socket) => {
   });
 
   // --- unirse a una sala existente ---
+  // intenta devolverle a alguien su sitio en una partida ya empezada (por desconexión o por
+  // haber salido él mismo) — true si lo consigue, false si de verdad no estaba en esa partida
+  async function intentarRecuperarSitio(socket, room, name, authToken) {
+    const usuario = await verificarUsuario(authToken);
+    let jugadorSala = usuario ? room.players.find(p => p.supabaseId === usuario.id) : null;
+    if (!jugadorSala) jugadorSala = room.players.find(p => p.name === name);
+
+    let idAnterior;
+    if (jugadorSala) {
+      idAnterior = jugadorSala.id;
+      jugadorSala.id = socket.id;
+    } else {
+      const jugadorPartida = room.game.players.find(p => p.name === name);
+      if (!jugadorPartida) return false;
+      idAnterior = jugadorPartida.id;
+      room.players.push({ id: socket.id, name: jugadorPartida.name, supabaseId: usuario ? usuario.id : null });
+    }
+
+    const jugadorPartida = room.game.players.find(p => p.id === idAnterior);
+    if (jugadorPartida) jugadorPartida.id = socket.id;
+    if (room.hostId === idAnterior) room.hostId = socket.id;
+    if (room.game.pendingTickets[idAnterior]) {
+      room.game.pendingTickets[socket.id] = room.game.pendingTickets[idAnterior];
+      delete room.game.pendingTickets[idAnterior];
+    }
+    if (usuario) onlineUsers[usuario.id] = socket.id;
+
+    socket.join(room.code);
+    socket.data.roomCode = room.code;
+    socket.emit('gameStarted', {});
+    broadcastGameState(room);
+    return true;
+  }
+
   socket.on('joinRoom', async ({ code, name, authToken }) => {
     code = (code || '').toUpperCase().trim();
     const room = rooms[code];
     if (!room) { socket.emit('errorMsg', 'No existe ninguna sala con ese código'); return; }
-    if (room.started) { socket.emit('errorMsg', 'Esa partida ya ha empezado'); return; }
+    if (room.started) {
+      const recuperado = room.game ? await intentarRecuperarSitio(socket, room, name, authToken) : false;
+      if (!recuperado) socket.emit('errorMsg', 'Esa partida ya ha empezado');
+      return;
+    }
     if (room.players.length >= 4) { socket.emit('errorMsg', 'La sala ya está llena (máximo 4)'); return; }
 
     const usuario = await verificarUsuario(authToken);
@@ -223,27 +261,8 @@ io.on('connection', (socket) => {
     code = (code || '').toUpperCase().trim();
     const room = rooms[code];
     if (!room || !room.game) { socket.emit('errorMsg', 'Esa sala ya no existe'); return; }
-
-    const usuario = await verificarUsuario(authToken);
-    let jugador = usuario ? room.players.find(p => p.supabaseId === usuario.id) : null;
-    if (!jugador) jugador = room.players.find(p => p.name === name);
-    if (!jugador) { socket.emit('errorMsg', 'No se te encuentra en esa partida'); return; }
-
-    const idAnterior = jugador.id;
-    jugador.id = socket.id;
-    const jugadorPartida = room.game.players.find(p => p.id === idAnterior);
-    if (jugadorPartida) jugadorPartida.id = socket.id;
-    if (room.hostId === idAnterior) room.hostId = socket.id;
-    if (room.game.pendingTickets[idAnterior]) {
-      room.game.pendingTickets[socket.id] = room.game.pendingTickets[idAnterior];
-      delete room.game.pendingTickets[idAnterior];
-    }
-    if (usuario) onlineUsers[usuario.id] = socket.id;
-
-    socket.join(code);
-    socket.data.roomCode = code;
-    socket.emit('gameStarted', {});
-    broadcastGameState(room);
+    const recuperado = await intentarRecuperarSitio(socket, room, name, authToken);
+    if (!recuperado) socket.emit('errorMsg', 'No se te encuentra en esa partida');
   });
 
   // --- el anfitrión pulsa "Empezar partida" ---
@@ -261,7 +280,7 @@ io.on('connection', (socket) => {
   });
 
   // --- acciones dentro de la partida ---
-  async function conRoomYPartida(socket, fn) {
+  async function conRoomYPartida(socket, fn, onResultado) {
     const code = socket.data.roomCode;
     const room = rooms[code];
     if (!room || !room.game) { socket.emit('errorMsg', 'No hay ninguna partida en marcha'); return; }
@@ -271,6 +290,7 @@ io.on('connection', (socket) => {
       socket.emit('errorMsg', resultado.error);
       return;
     }
+    if (onResultado) onResultado(room, resultado);
     await revisarFinDePartida(room);
     if (!room.game.ended) {
       const siguenBilletesIniciales = engine.hayEleccionInicialPendiente(room.game);
@@ -298,7 +318,13 @@ io.on('connection', (socket) => {
     conRoomYPartida(socket, room => engine.accionConfirmarBilletes(room.game, socket.id, indices));
   });
   socket.on('playSabotage', ({ routeId }) => {
-    conRoomYPartida(socket, room => engine.accionSabotaje(room.game, socket.id, routeId));
+    conRoomYPartida(socket, room => engine.accionSabotaje(room.game, socket.id, routeId), (room, resultado) => {
+      io.to(room.code).emit('duelResult', {
+        atacante: resultado.atacante, defensor: resultado.defensor,
+        cartasAtacante: resultado.cartasAtacante, cartasDefensor: resultado.cartasDefensor,
+        gano: resultado.gano,
+      });
+    });
   });
   socket.on('playDemolition', ({ routeId }) => {
     conRoomYPartida(socket, room => engine.accionDemolicion(room.game, socket.id, routeId));
@@ -349,3 +375,4 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log('Servidor de Tren Expreso escuchando en el puerto ' + PORT);
 });
+                
