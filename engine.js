@@ -310,7 +310,7 @@ function accionSabotaje(state, playerId, routeId) {
     addLog(state, `${p.name} choca ${attackerSize} cartas contra las ${defenderSize} de ${defender.name} y pierde: conserva su vía. Ambos pierden la mano.`);
   }
   finalizarTurno(state);
-  return { ok: true, gano: win };
+  return { ok: true, gano: win, atacante: p.name, defensor: defender.name, cartasAtacante: attackerSize, cartasDefensor: defenderSize };
 }
 
 /* ---- demolición ---- */
@@ -447,4 +447,4 @@ module.exports = {
   accionSabotaje, accionDemolicion, accionEstacion,
   hayEleccionInicialPendiente,
 };
-   
+                
